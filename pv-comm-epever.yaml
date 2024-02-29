@@ -1,0 +1,323 @@
+
+esphome:
+  name: pv-comm-epever
+  friendly_name: "Epsolar MPPT"
+  on_boot:
+    ## configure controller settings at setup
+    ## make sure priority is lower than setup_priority of modbus_controller
+    priority: -100
+    then:
+      - lambda: |-
+          // get local time and sync to controller
+          time_t now = ::time(nullptr);
+          struct tm *time_info = ::localtime(&now);
+          int seconds = time_info->tm_sec;
+          int minutes = time_info->tm_min;
+          int hour = time_info->tm_hour;
+          int day = time_info->tm_mday;
+          int month = time_info->tm_mon + 1;
+          int year = time_info->tm_year % 100;
+          esphome::modbus_controller::ModbusController *controller = id(epever);
+          // if there is no internet connection localtime returns year 70
+          if (year != 70) {
+            // create the payload
+            std::vector<uint16_t> rtc_data = {uint16_t((minutes << 8) | seconds), uint16_t((day << 8) | hour),
+                                              uint16_t((year << 8) | month)};
+            // Create a modbus command item with the time information as the payload
+            esphome::modbus_controller::ModbusCommandItem set_rtc_command =
+                esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(controller, 0x9013, 3, rtc_data);
+            // Submit the command to the send queue
+            epever->queue_command(set_rtc_command);
+            ESP_LOGI("ModbusLambda", "EPSOLAR RTC set to %02d:%02d:%02d %02d.%02d.%04d", hour, minutes, seconds, day, month,
+                    year + 2000);
+          }
+          // Battery settings
+          // Note: these values are examples only and apply my AGM Battery
+          std::vector<uint16_t> battery_settings1 = {
+              0,     // 9000 Battery Type 0 = User
+              200,   // 9001 Battery Cap 115AH
+              0,     // 9002 Temp compensation -3V /°C/2V
+              6500,  // 9003 Over Voltage Disconnect Voltage 15.0
+              6230,  // 9004 Charging Limit Voltage 14.8
+              6220,  // 9005 Over Voltage Reconnect Voltage 14.8
+              6210,  // 9006 Equalize Charging Voltage 14.6
+              6032,  // 9007 Boost Charging Voltage 14.7
+              6030,  // 9008 Float Charging Voltage 13.6
+              5900,  // 9009 Boost Reconnect Charging Voltage 13.2
+              5800,  // 900A Low Voltage Reconnect Voltage 12.2
+              5400,  // 900B Under Voltage Warning Reconnect Voltage 12.0
+              5300,  // 900c Under Volt. Warning Volt 12.1
+              5200,  // 900d Low Volt. Disconnect Volt. 11.8
+              5200   // 900E Discharging Limit Voltage 11.8
+          };
+
+          // Boost and equalization periods
+          std::vector<uint16_t> battery_settings3 = {
+              0x0000,  // 906B Equalize Duration (min.) 0
+              0x0075   // 906C Boost Duration (aka absorb) 117 mins
+          };
+          esphome::modbus_controller::ModbusCommandItem set_battery1_command =
+              esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(controller, 0x9000, battery_settings1.size() ,
+                                                                                          battery_settings1);
+          //   esphome::modbus_controller::ModbusCommandItem set_battery2_command =
+          //   esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(controller, 0x900A, battery_settings2.size() ,
+          //                                                                              battery_settings2);
+
+          esphome::modbus_controller::ModbusCommandItem set_battery3_command =
+              esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(controller, 0x906B, battery_settings3.size(),
+                                                                                          battery_settings3);
+          delay(200) ;
+          controller->queue_command(set_battery1_command);
+          delay(200) ;
+          // controller->queue_command(set_battery2_command);
+          // delay(200) ;
+          controller->queue_command(set_battery3_command);
+          ESP_LOGI("ModbusLambda", "EPSOLAR Battery set");  
+  #...
+  platformio_options:
+    ## larger stack size required with all registers enable_load_test
+    ## reduce registers or wait for integration of 2.0.0 arduinoespressif32
+    ## not yet working needs 2.0
+    build_flags:
+      - -DCONFIG_ARDUINO_LOOP_STACK_SIZE=32768
+
+
+
+esp32:
+  board: lolin_s2_mini
+  variant: esp32s2
+  framework:
+    type: esp-idf
+
+
+wifi:
+  ssid: !secret wifi2_ssid
+  password: !secret wifi2_password
+  output_power: 8.5dB
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret encryption_key
+ota:
+  password: !secret ota_password
+
+web_server:
+  port: 80
+  local: true
+
+logger:
+  baud_rate: 0
+
+time:
+  - platform: sntp
+    id: sntp_time
+    servers: "pool.ntp.org"
+
+uart:
+  id: mod_bus
+  tx_pin: 18
+  rx_pin: 16
+  baud_rate: 115200
+  stop_bits: 1
+
+modbus:
+  flow_control_pin: 33
+  send_wait_time: 200ms
+  id: mod_bus_epever
+
+modbus_controller:
+  - id: epever
+    ## the Modbus device addr
+    address: 0x1
+    modbus_id: mod_bus_epever
+    command_throttle: 200ms
+    setup_priority: -10
+    update_interval: 2s
+
+#packages:
+  #tracer-rated-datum: !include pv-comm-epever-rated-datum.yaml
+  #tracer-real-time: !include pv-comm-epever-real-time.yaml
+  #tracer-stats: !include pv-comm-epever-stats.yaml
+  #tracer-settings: !include pv-comm-epever-settings.yaml
+
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 10s
+  
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: pv_input_voltage
+    name: "PV array input voltage"
+    address: 0x3100
+    unit_of_measurement: "V" ## for any other unit the value is returned in minutes
+    register_type: read
+    value_type: U_WORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: pv_input_current
+    name: "PV array input current"
+    address: 0x3101
+    unit_of_measurement: "A" ## for any other unit the value is returned in minutes
+    register_type: read
+    value_type: U_WORD
+    accuracy_decimals: 2
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: pv_input_power
+    name: "PV array input power"
+    address: 0x3102
+    unit_of_measurement: "W" ## for any other unit the value is returned in minutes
+    register_type: read
+    value_type: U_DWORD_R
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.01
+
+
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: charging_voltage
+    name: "Charging voltage"
+    address: 0x3104
+    unit_of_measurement: "V"
+    register_type: read
+    value_type: U_WORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: charging_current
+    name: "Charging current"
+    address: 0x3105
+    unit_of_measurement: "A"
+    register_type: read
+    value_type: U_WORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: charging_power
+    name: "Charging power"
+    address: 0x3106
+    unit_of_measurement: "W"
+    register_type: read
+    value_type: U_DWORD_R
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.01
+  
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: load_voltage
+    name: "Load voltage"
+    address: 0x310C
+    unit_of_measurement: "V"
+    register_type: read
+    value_type: U_WORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: load_current
+    name: "Load Current"
+    address: 0x310D
+    unit_of_measurement: "A"
+    register_type: read
+    value_type: U_WORD
+    accuracy_decimals: 2
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: load_power
+    name: "Load power"
+    address: 0x310E
+    unit_of_measurement: "W"
+    register_type: read
+    value_type: U_DWORD_R
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.01
+ 
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: battery_temperature
+    name: "Battery temperature"
+    address: 0x3110
+    unit_of_measurement: °C
+    device_class: "temperature"
+    state_class: "measurement"
+    register_type: read
+    value_type: S_WORD
+    accuracy_decimals: 1
+    skip_updates: 5
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: device_temperature
+    name: "Device temperature"
+    address: 0x3111
+    unit_of_measurement: °C
+    device_class: "temperature"
+    state_class: "measurement"
+    register_type: read
+    value_type: S_WORD
+    accuracy_decimals: 1
+    skip_updates: 5
+    filters:
+      - multiply: 0.01
+
+
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: generated_energy_today
+    name: "Generated energy today"
+    address: 0x330C
+    register_type: read
+    value_type: U_DWORD_R
+    accuracy_decimals: 0
+    unit_of_measurement: "Wh"
+    device_class: energy
+    state_class: total_increasing
+    filters:
+      - multiply: 10.0
+
+
+binary_sensor:
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: charging_input_volt_failure
+    name: "Charging Input Volt Failure"
+    register_type: read
+    address: 0x3201
+    bitmask: 0xC000
+
+switch:
+  - platform: modbus_controller
+    modbus_controller_id: epever
+    id: manual_control_load
+    register_type: coil
+    address: 2
+    name: "Load control"
+    bitmask: 1
+
+text_sensor:
+  
